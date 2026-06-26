@@ -1,0 +1,3 @@
+Folder kept from the original web-app scaffold. The scraper is a CLI tool with
+no HTTP routes, so there is nothing here. The "controller" that drives a run is
+src/controllers/scrapeController.js.
