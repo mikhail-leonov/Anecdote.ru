@@ -1,4 +1,0 @@
--- Intentionally empty.
--- Per the project spec, this scraper uses NO database. Durable state is kept
--- as JSON files under data/ (handled by src/db/jsonStore.js). This file is
--- retained only to preserve the original project structure.
