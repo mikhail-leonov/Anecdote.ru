@@ -1,13 +1,15 @@
 /**
  * src/services/postParser.js
  * -----------------------------------------------------------------------------
- * Parses a listing (index) page and returns the dedicated post-page URLs worth
- * visiting. A post qualifies only if:
- *   - it is not inside an advertisement/sponsored container, and
- *   - it appears to contain an image (text-only posts are ignored), and
- *   - it links to a dedicated post page we can open.
+ * anekdot.ru parser. Two jobs:
  *
- * Detection is deliberately conservative.
+ *   1. parseTags()  — from the tags index (/tags/), return every category link
+ *                     in the tags-cloud as { url, name } (name = decoded slug).
+ *   2. parsePosts() — from a tag page, return every TEXT anecdote as
+ *                     { type:'anecdote', id, text, url }.
+ *
+ * "Save only texts": topicboxes whose .text contains an <img>/<video>/<iframe>
+ * (картинки / видео) are skipped. The stable data-id is used as the resume key.
  * -----------------------------------------------------------------------------
  */
 
@@ -22,160 +24,125 @@ export class PostParser {
     this.#logger = logger;
   }
 
+  // --- tags index ------------------------------------------------------------
+
   /**
-   * @param {import('cheerio').CheerioAPI} $  loaded listing page
-   * @param {string} pageUrl                  the listing page URL
-   * @returns {Array<{type:'media'|'anecdote', postUrl?:string, title:string, text?:string}>}
+   * @param {import('cheerio').CheerioAPI} $  loaded /tags/ page
+   * @param {string} baseUrl                  the tags index URL (for resolving)
+   * @returns {Array<{url:string, name:string}>}
+   */
+  parseTags($, baseUrl) {
+    const sel = this.#config.selectors.tagLink;
+    const tags = [];
+    const seen = new Set();
+
+    $(sel).each((_i, a) => {
+      const href = $(a).attr('href');
+      if (!href) return undefined;
+      const url = resolveUrl(href, baseUrl);
+      if (!url) return undefined;
+      // Only keep links into /tags/<slug>.
+      if (!/\/tags\/[^/]+/.test(new URL(url).pathname)) return undefined;
+      const key = normalizeUrl(url);
+      if (seen.has(key)) return undefined;
+      seen.add(key);
+      tags.push({ url, name: this.#tagNameFromUrl(url) });
+      return undefined;
+    });
+
+    return tags;
+  }
+
+  /** Decode the category name from a tag URL slug (handles a trailing /<page>). */
+  #tagNameFromUrl(url) {
+    try {
+      const u = new URL(url);
+      const seg = u.pathname.replace(/\/+$/, '').split('/').filter(Boolean);
+      let slug = seg[seg.length - 1];
+      if (/^\d+$/.test(slug) && seg.length >= 2) slug = seg[seg.length - 2];
+      try {
+        return decodeURIComponent(slug);
+      } catch {
+        return slug;
+      }
+    } catch {
+      return '';
+    }
+  }
+
+  // --- tag page (anecdotes) --------------------------------------------------
+
+  /**
+   * @param {import('cheerio').CheerioAPI} $  loaded tag page
+   * @param {string} pageUrl                  the tag page URL (for resolving)
+   * @returns {Array<{type:'anecdote', id:string, text:string, url:string}>}
    */
   parsePosts($, pageUrl) {
     const { selectors } = this.#config;
+    const minLen = this.#config.behavior.anecdoteMinLength || 15;
+    const out = [];
     const seen = new Set();
-    const posts = [];
 
     $(selectors.post).each((_i, el) => {
-      const $post = $(el);
+      const $box = $(el);
 
-      if (this.#isAd($, $post)) {
-        this.#logger.debug('skip post: advertisement/sponsored');
-        return;
+      if (this.#isAd($, $box)) {
+        this.#logger.debug('skip topicbox: advertisement/sponsored');
+        return undefined;
       }
 
-      const title = this.#findTitle($, $post);
+      const $text = $box.find(selectors.anecdoteText).first();
+      if (!$text.length) return undefined;
 
-      // (a) ANECDOTE first — its header carries a tiny bullet <img>, so checking
-      // media first would misclassify it.
-      if (this.#config.behavior.saveAnecdotes && this.#looksLikeAnecdote($, $post)) {
-        const texts = this.#anecdoteText($, $post);
-        for (const text of texts) {
-          if (text) {
-            posts.push({ type: 'anecdote', title, text });
-          }
-        }
-        return;
+      // "Save only texts": skip picture / video / embed boxes.
+      if ($text.find('img, video, iframe, picture, source, object, embed').length > 0) {
+        this.#logger.debug('skip topicbox: media (not text)');
+        return undefined;
       }
 
-      // (b) MEDIA
-      if (this.#hasMedia($, $post)) {
-        const urls = this.#findMediaUrls($, $post, pageUrl);
-        if (urls.length === 0) {
-          this.#logger.debug('skip media post: no link found');
-          return;
-        }
-        for (const u of urls) {
-          const key = normalizeUrl(u);
-          if (seen.has(key)) continue;
-          seen.add(key);
-          posts.push({ type: 'media', postUrl: u, title });
-        }
-        return;
+      const text = this.#extractText($, $text);
+      if (text.length < minLen) {
+        this.#logger.debug('skip topicbox: too short / empty');
+        return undefined;
       }
 
-      this.#logger.debug('skip post: not media, not anecdote');
+      const id = ($box.attr('data-id') || '').trim();
+      const url = id ? (resolveUrl(`/id/${id}/`, pageUrl) || '') : '';
+
+      const key = id ? `id:${id}` : `txt:${text.slice(0, 120)}`;
+      if (seen.has(key)) return undefined; // same box twice on one page
+      seen.add(key);
+
+      out.push({ type: 'anecdote', id, text, url });
+      return undefined;
     });
 
-    return posts;
+    return out;
   }
 
   // --- helpers ---------------------------------------------------------------
 
-  /**
-   * Extract the post title from the header cell.
-   */
-  #findTitle($, $post) {
-    const titleSel = this.#config.selectors.postTitle;
-    let raw = titleSel ? $post.find(titleSel).first().text() : '';
-    if (!raw) raw = $post.find(this.#config.selectors.postLink).first().text();
-    const sep = this.#config.selectors.titleSeparator;
-    if (sep && raw.includes(sep)) raw = raw.split(sep)[0];
-    return raw.replace(/\s+/g, ' ').trim();
+  /** Turn <br> into newlines and tidy whitespace, preserving joke line breaks. */
+  #extractText($, $text) {
+    $text.find('br').replaceWith('\n');
+    let raw = $text.text();
+    raw = raw
+      .replace(/\u00a0/g, ' ')      // nbsp -> space
+      .replace(/\r\n?/g, '\n')
+      .replace(/[ \t]+\n/g, '\n')   // trailing spaces on a line
+      .replace(/\n[ \t]+/g, '\n')   // leading spaces on a line
+      .replace(/[ \t]{2,}/g, ' ')   // collapse runs of spaces
+      .replace(/\n{3,}/g, '\n\n')   // collapse blank-line runs
+      .trim();
+    return raw;
   }
 
-  /** A post carries media if it has a media link or a <video>. */
-  #hasMedia($, $post) {
-    const ml = this.#config.selectors.mediaLink;
-    if (ml && $post.find(ml).length > 0) return true;
-    if ($post.find('video, video source').length > 0) return true;
-    if (!ml && this.#hasImage($, $post)) return true;
-    return false;
-  }
-
-  /** All distinct media URLs in a post */
-  #findMediaUrls($, $post, pageUrl) {
-    const urls = [];
-    const seen = new Set();
-    const sels = [this.#config.selectors.mediaLink, this.#config.selectors.postLink].filter(Boolean);
-    for (const sel of sels) {
-      $post.find(sel).each((_i, a) => {
-        const h = $(a).attr('href');
-        if (!h) return;
-        if (h.startsWith('#') || h.startsWith('mailto:') || h.startsWith('javascript:')) return;
-        const abs = resolveUrl(h, pageUrl);
-        if (abs && !seen.has(abs)) {
-          seen.add(abs);
-          urls.push(abs);
-        }
-      });
-      if (urls.length > 0) break;
-    }
-    return urls;
-  }
-
-  /** A non-media post is an anecdote when it carries the section marker. */
-  #looksLikeAnecdote($, $post) {
-    const marker = this.#config.selectors.anecdoteMarker;
-    if (marker) return $post.find(marker).length > 0;
-    return true; // fallback
-  }
-
-  /**
-   * Extract anecdote text and split into separate anecdotes on <br><br><br>
-   */
-  #anecdoteText($, $post) {
-    const sel = this.#config.selectors.anecdoteText;
-    const $c = sel ? $post.find(sel).first() : $post;
-    if (!$c.length) return [];
-
-    // Replace <br> with newlines for easier splitting
-    $c.find('br').replaceWith('\n');
-
-    const raw = $c.text().trim();
-    if (!raw) return [];
-
-    // Split on triple newlines (which come from <br><br><br>)
-    const blocks = raw.split(/\n\s*\n\s*\n/);
-
-    return blocks
-      .map(block => block.trim())
-      .filter(block => block.length >= (this.#config.behavior.anecdoteMinLength || 40));
-  }
-
-  /** True if the post sits inside (or is itself) an ad container. */
-  #isAd($, $post) {
+  /** True if the box sits inside (or is itself) an ad container. */
+  #isAd($, $box) {
     const adSel = this.#config.selectors.adContainer;
     if (!adSel) return false;
-    if ($post.is(adSel)) return true;
-    return $post.closest(adSel).length > 0 || $post.find(adSel).length > 0;
-  }
-
-  /** True if the post contains a content image in the listing markup. */
-  #hasImage($, $post) {
-    const imgs = $post.find(this.#config.selectors.postThumbnail);
-    if (imgs.length === 0) return false;
-    let found = false;
-    imgs.each((_i, img) => {
-      const $img = $(img);
-      if (
-        $img.attr('src') ||
-        $img.attr('data-src') ||
-        $img.attr('data-original') ||
-        $img.attr('srcset')
-      ) {
-        found = true;
-        return false; // break
-      }
-      return undefined;
-    });
-    return found;
+    if ($box.is(adSel)) return true;
+    return $box.closest(adSel).length > 0;
   }
 }
 

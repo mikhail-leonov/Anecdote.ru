@@ -1,11 +1,14 @@
 /**
  * src/services/anecdoteWriter.js
  * -----------------------------------------------------------------------------
- * Each anecdote = separate object. Splits on <br><br><br> / multiple newlines.
+ * Stores text anecdotes as JSON, 500 per file (anecdotes.json, then
+ * anecdotes_1.json, anecdotes_2.json, ...). Each anecdote is one object:
  *
- * Every anecdote carries a `tags` array (default ["pejnya"]) so saved jokes can
- * be grouped/filtered by source. New anecdotes are tagged on write; any
- * pre-existing anecdotes are back-filled with the tag on startup.
+ *   { title, text, tags: [...], addedAt, url? }
+ *
+ * Tags are supplied per write (the anekdot.ru category, e.g. ["армия"]).
+ * De-duplication is by normalized text hash, so the same joke is never stored
+ * twice even when it appears under more than one category.
  * -----------------------------------------------------------------------------
  */
 
@@ -19,7 +22,7 @@ const ANECDOTE_COUNT_THRESHOLD = 500;
 export class AnecdoteWriter {
   #file;
   #logger;
-  #tags;
+  #defaultTags;
   #buffer = [];
   #anecdotes = [];
   #hashes = new Set();
@@ -28,10 +31,10 @@ export class AnecdoteWriter {
   #nextIndex = 1;
   #fileCounts = new Map();
 
-  constructor({ file, logger, tags = ['pejnya'] }) {
+  constructor({ file, logger, tags = [] }) {
     this.#file = file;
     this.#logger = logger;
-    this.#tags = Array.isArray(tags) && tags.length ? [...tags] : ['pejnya'];
+    this.#defaultTags = Array.isArray(tags) ? [...tags] : [];
   }
 
   async init() {
@@ -48,14 +51,12 @@ export class AnecdoteWriter {
     for (const f of files) {
       const fullPath = path.join(dir, f);
       const data = await readJsonSafe(fullPath, { title: this.#title, anecdotes: [] });
-
-      let loaded = Array.isArray(data.anecdotes) ? data.anecdotes : [];
-
+      const loaded = Array.isArray(data.anecdotes) ? data.anecdotes : [];
       this.#fileCounts.set(fullPath, loaded.length);
 
       for (const a of loaded) {
         if (!a?.text?.trim()) continue;
-        this.#applyTags(a); // keep in-memory copies tagged too
+        if (!Array.isArray(a.tags)) a.tags = [];
         const hash = AnecdoteWriter.hashOf(a.text);
         if (!this.#hashes.has(hash)) {
           this.#hashes.add(hash);
@@ -68,54 +69,26 @@ export class AnecdoteWriter {
     }
 
     this.#nextIndex = maxIndex + 1;
-
-    // Back-fill the tag into anecdotes saved before tagging existed.
-    await this.#backfillTags(files.map(f => path.join(dir, f)));
-
     this.#logger.debug(`AnecdoteWriter loaded ${this.#anecdotes.length} anecdotes`);
     return this;
   }
 
   static hashOf(text) {
     return createHash('sha256')
-      .update(text.trim().replace(/\s+/g, ' '))
+      .update(String(text).trim().replace(/\s+/g, ' '))
       .digest('hex');
   }
 
-  /** Ensure an anecdote object carries the configured tags. Mutates in place. */
-  #applyTags(entry) {
-    if (!entry || typeof entry !== 'object') return false;
-    if (!Array.isArray(entry.tags)) {
-      entry.tags = [...this.#tags];
-      return true;
-    }
-    let changed = false;
-    for (const t of this.#tags) {
-      if (!entry.tags.includes(t)) {
-        entry.tags.push(t);
-        changed = true;
-      }
-    }
-    return changed;
-  }
-
-  /** Add the tag to any on-disk anecdote that lacks it (atomic, idempotent). */
-  async #backfillTags(paths) {
-    for (const full of paths) {
-      const data = await readJsonSafe(full, null);
-      if (!data || !Array.isArray(data.anecdotes)) continue;
-      let changed = false;
-      for (const a of data.anecdotes) {
-        if (this.#applyTags(a)) changed = true;
-      }
-      if (changed) {
-        await writeJsonAtomic(full, data);
-        this.#logger.debug(`Back-filled tags in ${path.basename(full)}`);
-      }
-    }
-  }
-
-  async write({ text, title = 'Подборка анекдотов', url = '', dryRun = false }) {
+  /**
+   * Add one anecdote.
+   * @param {object} p
+   * @param {string} p.text         the anecdote body
+   * @param {string} [p.title='']   optional title (anekdot anecdotes have none)
+   * @param {string} [p.url='']     optional permalink
+   * @param {string[]} [p.tags]     category tags for this anecdote
+   * @param {boolean} [p.dryRun=false]
+   */
+  async write({ text, title = '', url = '', tags, dryRun = false }) {
     const body = (text || '').trim();
     if (!body) return { status: 'skipped', reason: 'empty' };
 
@@ -123,15 +96,19 @@ export class AnecdoteWriter {
     if (this.#hashes.has(hash)) return { status: 'skipped', reason: 'duplicate' };
 
     if (dryRun) {
-      this.#logger.info(`DRY   would add anecdote`);
+      this.#logger.info('DRY   would add anecdote');
       return { status: 'dry-run' };
     }
 
+    const entryTags = (Array.isArray(tags) && tags.length ? tags : this.#defaultTags)
+      .map(t => String(t).trim())
+      .filter(Boolean);
+
     const entry = {
-      title: title.trim(),
+      title: String(title || '').trim(),
       text: body,
-      tags: [...this.#tags],
-      addedAt: new Date().toISOString()
+      tags: [...new Set(entryTags)],
+      addedAt: new Date().toISOString(),
     };
     if (url) entry.url = url;
 
@@ -139,7 +116,9 @@ export class AnecdoteWriter {
     this.#hashes.add(hash);
     this.#dirty = true;
 
-    this.#logger.info(`TEXT  added anecdote (${body.slice(0, 50).replace(/\n/g, ' ')}...)`);
+    this.#logger.info(
+      `TEXT  added anecdote [${entry.tags.join(', ')}] (${body.slice(0, 50).replace(/\n/g, ' ')}...)`,
+    );
     return { status: 'written' };
   }
 
@@ -149,6 +128,7 @@ export class AnecdoteWriter {
     const activePath = this.#file;
     let activeCount = this.#fileCounts.get(activePath) || 0;
 
+    // Rotate the active file to anecdotes_<n>.json once it would exceed 500.
     if (activeCount > 0 && (activeCount + this.#buffer.length) > ANECDOTE_COUNT_THRESHOLD) {
       const dir = path.dirname(activePath);
       const indexedPath = path.join(dir, `anecdotes_${this.#nextIndex}.json`);
@@ -167,7 +147,7 @@ export class AnecdoteWriter {
 
     const updated = {
       title: this.#title,
-      anecdotes: [...existing, ...this.#buffer]
+      anecdotes: [...existing, ...this.#buffer],
     };
 
     await writeJsonAtomic(activePath, updated);
@@ -179,7 +159,7 @@ export class AnecdoteWriter {
   }
 
   get count() {
-    return this.#anecdotes.length;
+    return this.#anecdotes.length + this.#buffer.length;
   }
 }
 

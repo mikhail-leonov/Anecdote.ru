@@ -1,15 +1,17 @@
 /**
- * src/pagination.js
+ * src/services/pagination.js
  * -----------------------------------------------------------------------------
- * Determines the URL of the next listing page. Two strategies, in order:
+ * Determines the URL of the next listing page. Strategies, in order:
  *
- *   1. DOM strategy  — follow a "next" link located via config.selectors.nextPage
- *                      (rel="next", .next a, etc.). This is the most reliable.
- *   2. Pattern strategy — if no link is found and config.pagination.urlPattern
- *                      is set, derive the next page number from the current URL
- *                      and build the next URL (e.g. /page/2/ -> /page/3/).
+ *   1. Link by TEXT — within config.selectors.nextPage, follow the first anchor
+ *      whose text contains config.selectors.nextPageText (e.g. "след"). This is
+ *      how anekdot.ru's `.pageslist` "след. →" link is followed. Recomputed by
+ *      the server relative to the current page, so the daily +1 shift is absorbed.
+ *   2. Link (first) — if no nextPageText is configured, follow the first
+ *      nextPage anchor's href.
+ *   3. URL pattern — fallback when config.pagination.urlPattern is set.
  *
- * Returns null when neither strategy yields a new page, which stops the crawl.
+ * Returns null when nothing yields a new page, which ends the (tag) crawl.
  * -----------------------------------------------------------------------------
  */
 
@@ -30,10 +32,26 @@ export class Pagination {
    * @returns {string|null}                  next page URL, or null to stop
    */
   getNextPageUrl($, currentUrl) {
-    // (1) DOM strategy.
     const sel = this.#config.selectors.nextPage;
+    const txt = this.#config.selectors.nextPageText;
+
     if (sel) {
-      const href = $(sel).first().attr('href');
+      let href = null;
+
+      if (txt) {
+        const needle = String(txt).toLowerCase();
+        $(sel).each((_i, el) => {
+          const t = $(el).text().trim().toLowerCase();
+          if (t.includes(needle)) {
+            href = $(el).attr('href');
+            return false; // first match wins (the "next" link)
+          }
+          return undefined;
+        });
+      } else {
+        href = $(sel).first().attr('href');
+      }
+
       if (href) {
         const next = resolveUrl(href, currentUrl);
         if (next && normalizeUrl(next) !== normalizeUrl(currentUrl)) {
@@ -43,7 +61,7 @@ export class Pagination {
       }
     }
 
-    // (2) Pattern strategy (fallback).
+    // Pattern fallback (disabled for anekdot.ru: urlPattern is empty).
     const pattern = this.#config.pagination.urlPattern;
     if (pattern) {
       const next = this.#nextByPattern(currentUrl, pattern);
@@ -57,9 +75,9 @@ export class Pagination {
   }
 
   /**
-   * Derive the next page URL from a pattern like '/page/{n}/'. Works whether the
-   * current URL already contains the pattern (increment it) or is the bare root
-   * (treat as page 1 and produce page 2).
+   * Derive the next page URL from a pattern like '/page/{n}/' or
+   * '/index.php?page={n}'. Increments an existing page number, or fabricates
+   * page 2 from a listing root. Returns null when it doesn't apply.
    */
   #nextByPattern(currentUrl, pattern) {
     let url;
@@ -69,8 +87,6 @@ export class Pagination {
       return null;
     }
 
-    // Match against pathname + search so query-string patterns work too
-    // (e.g. '/index.php?page={n}' as well as '/page/{n}/').
     const combined = url.pathname + url.search;
     const re = new RegExp(
       pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\{n\\}', '(\\d+)'),
@@ -78,16 +94,11 @@ export class Pagination {
     const m = combined.match(re);
 
     if (m) {
-      // Currently on page N -> go to N+1. Rebuild from the pattern so both the
-      // path and query are produced correctly.
       const n = parseInt(m[1], 10) + 1;
       const nextRef = pattern.replace('{n}', String(n));
       return resolveUrl(nextRef, `${url.origin}/`);
     }
 
-    // First page (no page number yet). Only fabricate "page 2" from a listing
-    // root (path "/" or the pattern's own base path) so we never append a page
-    // segment onto an arbitrary URL.
     const base = pattern.split('{n}')[0].split('?')[0].replace(/\/+$/, '');
     const path0 = url.pathname.replace(/\/+$/, '');
     if (path0 === '' || path0 === base) {
